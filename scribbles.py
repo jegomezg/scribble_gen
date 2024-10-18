@@ -16,6 +16,11 @@ import torch
 import torch.nn.functional as F
 from torchvision import transforms
 
+import numpy as np
+import cv2
+import random
+from scipy.interpolate import splprep, splev
+
 
 
 def draw_scribble_line(img: np.ndarray, p1: Tuple[int, int], p2: Tuple[int, int], color: Tuple[int, int, int], thickness: int, epsilon: float = 1.0):
@@ -223,68 +228,115 @@ def generate_border_multiclass_scribbles(multiclass_image: np.ndarray,
 
     return scribbles_image
 
-def generate_scribbles_inside_contours(
-    multiclass_image: np.ndarray, 
-    intern_scribble_num_scribbles_per_contour: int, 
-    intern_scribble_max_scribble_length: int, 
-    intern_scribble_thickness_range: Tuple[int, int],
-    intern_scribble_edge_thickness: int
+
+import numpy as np
+import cv2
+import random
+from typing import Tuple, List
+from skimage.morphology import skeletonize
+import matplotlib.pyplot as plt
+from scipy.interpolate import splprep, splev
+import networkx as nx
+
+def skeletonize_class_mask(class_mask: np.ndarray) -> np.ndarray:
+    return skeletonize(class_mask).astype(np.uint8)
+
+def skeleton_to_graph(skeleton: np.ndarray) -> nx.Graph:
+    G = nx.Graph()
+    rows, cols = skeleton.shape
+    for y in range(rows):
+        for x in range(cols):
+            if skeleton[y, x]:
+                G.add_node((x, y))
+                for dy in [-1, 0, 1]:
+                    for dx in [-1, 0, 1]:
+                        if dy == 0 and dx == 0:
+                            continue
+                        nx_ = x + dx
+                        ny_ = y + dy
+                        if 0 <= nx_ < cols and 0 <= ny_ < rows:
+                            if skeleton[ny_, nx_] and not G.has_edge((x, y), (nx_, ny_)):
+                                G.add_edge((x, y), (nx_, ny_))
+    return G
+
+def get_skeleton_endpoints(G: nx.Graph) -> List[Tuple[int, int]]:
+    return [node for node, degree in G.degree() if degree == 1]
+
+def get_random_paths(G: nx.Graph, num_paths: int) -> List[List[Tuple[int, int]]]:
+    endpoints = get_skeleton_endpoints(G)
+    paths = []
+    if len(endpoints) < 2:
+        return paths
+
+    for _ in range(num_paths):
+        if len(endpoints) < 2:
+            break
+        start, end = random.sample(endpoints, 2)
+        try:
+            path = nx.shortest_path(G, source=start, target=end)
+            if path not in paths:
+                paths.append(path)
+        except nx.NetworkXNoPath:
+            continue
+    return paths
+
+def smooth_path_with_spline(path: List[Tuple[int, int]], smooth_factor: float = 0.0) -> np.ndarray:
+    if len(path) < 4:
+        return np.array(path)
+    x, y = zip(*path)
+    try:
+        tck, u = splprep([x, y], s=smooth_factor, k=3)
+        u_fine = np.linspace(0, 1, 100)
+        x_fine, y_fine = splev(u_fine, tck)
+        return np.vstack((x_fine, y_fine)).T.astype(np.int32)
+    except (TypeError, ValueError):
+        return np.array(path)
+
+def draw_scribbles(
+    scribbles: np.ndarray,
+    paths: List[np.ndarray],
+    class_id: int,
+    thickness_range: Tuple[int, int]
+) -> None:
+    for path in paths:
+        if len(path) < 2:
+            continue
+        thickness = random.randint(*thickness_range)
+        cv2.polylines(scribbles, [path], isClosed=False, color=int(class_id), thickness=thickness)
+
+def generate_scribbles_with_skeleton(
+    multiclass_image: np.ndarray,
+    num_scribbles_per_class: int,
+    thickness_range: Tuple[int, int],
+    smooth_factor: float = 0.0,
+    edge_thickness: int = 5
 ) -> np.ndarray:
-    """
-    Generates scribbles within the contours of class regions in a mask image and applies a buffer zone to the edges.
-
-    Args:
-        mask (np.ndarray): An image mask with different classes labeled as different integer values.
-        num_scribbles_per_contour (int): The number of scribbles to generate per contour.
-        max_scribble_length (int): The maximum length of each scribble.
-        thickness_range (Tuple[int, int]): A tuple specifying the minimum and maximum thickness of the scribbles.
-        edge_thickness (int): The thickness of the buffer zone around the edges of the contours.
-
-    Returns:
-        np.ndarray: An image array of the same shape as the input mask with scribbles drawn inside the contours 
-        of the mask classes and a buffer around the edges of these contours.
-    """
     scribbles = np.zeros_like(multiclass_image, dtype=np.uint8)
     classes = np.unique(multiclass_image)
 
     for class_id in classes:
-        if class_id == 0:  # Skip background
-            continue
+        if class_id == 0:
+            continue  # Skip background
 
+        print(f"Processing Class {class_id}...")
         class_mask = (multiclass_image == class_id).astype(np.uint8)
-        filled_contours = np.zeros_like(multiclass_image, dtype=np.uint8)
-        contours, _ = cv2.findContours(class_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(filled_contours, contours, -1, color=1, thickness=cv2.FILLED)
+        skeleton = skeletonize_class_mask(class_mask)
+        G = skeleton_to_graph(skeleton)
+        paths = get_random_paths(G, num_scribbles_per_class)
+        if not paths:
+            print(f"  No paths found for Class {class_id}.")
+            continue
+        smoothed_paths = [smooth_path_with_spline(path, smooth_factor) for path in paths]
+        draw_scribbles(scribbles, smoothed_paths, class_id, thickness_range)
+        print(f"  Scribbles drawn for Class {class_id}.")
 
-        for contour in contours:
-            for _ in range(intern_scribble_num_scribbles_per_contour):
-                # Generate random points inside the contour
-                possible_points = np.argwhere(filled_contours == 1)
-                if len(possible_points) > 0:
-                    start_point_idx = random.choice(range(len(possible_points)))
-                    start_point = tuple(possible_points[start_point_idx])
-
-                    # Generate a random angle and length for the scribble
-                    angle = random.uniform(0, 2 * np.pi)
-                    length = random.randint(1, intern_scribble_max_scribble_length)
-                    
-                    # Calculate end point
-                    end_x = int(start_point[1] + length * np.cos(angle))
-                    end_y = int(start_point[0] + length * np.sin(angle))
-                    end_point = (end_x, end_y)
-
-                    # Check if the end point is inside the contour
-                    if 0 <= end_x < multiclass_image.shape[1] and 0 <= end_y < multiclass_image.shape[0] and filled_contours[end_y, end_x] == 1:
-                        # Draw the scribble
-                        thickness = random.randint(*intern_scribble_thickness_range)
-                        color  = int(class_id) 
-                        cv2.line(scribbles, start_point[::-1], end_point, color, thickness)
-                        
-        edges = cv2.Canny(multiclass_image, 1, 1)
-        dilated_edges = cv2.dilate(edges, np.ones((intern_scribble_edge_thickness, intern_scribble_edge_thickness), np.uint8))
-
-    # Assign background color to the dilated edge areas in the scribbles image
+    # Apply edge buffer
+    print("\nApplying edge buffer to prevent scribbles from touching class boundaries...")
+    edges = cv2.Canny(multiclass_image, 100, 200)  # Adjusted thresholds
+    dilated_edges = cv2.dilate(edges, np.ones((edge_thickness, edge_thickness), np.uint8))
     scribbles[dilated_edges > 0] = 0
     scribbles = np.where(multiclass_image == scribbles, scribbles, 0)
 
+    print("Scribble generation completed.")
     return scribbles
+
